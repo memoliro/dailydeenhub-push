@@ -1,6 +1,6 @@
 /* Bundled single-file worker for dashboard deploy.
    Sources: src/webpush.js + src/prayer.js + src/index.js
-   Built: 2026-10-10 — includes /api/debug endpoint */
+   Built: 2026-10-10 — includes /api/debug endpoint + Urgency:high on pushes */
 /* Minimal Web Push (RFC 8291 aes128gcm + VAPID RFC 8292) for Cloudflare Workers.
    Uses WebCrypto only. No Node dependencies. */
 
@@ -125,7 +125,7 @@ async function encryptPayload(p256dhB64, authB64, payloadBytes) {
 }
 
 /* Send one push. sub = {endpoint, p256dh, auth}. payloadObj -> JSON. */
-async function sendPush(sub, payloadObj, vapid) {
+export async function sendPush(sub, payloadObj, vapid) {
   const endpoint = new URL(sub.endpoint);
   const audience = endpoint.origin;
   const payloadBytes = enc.encode(JSON.stringify(payloadObj));
@@ -140,19 +140,19 @@ async function sendPush(sub, payloadObj, vapid) {
       'Content-Encoding': 'aes128gcm',
       'Content-Type': 'application/octet-stream',
       'TTL': '300',
+      'Urgency': 'high',
     },
     body,
   });
   return res.status;
 }
-
 /* Prayer-time fetching (Aladhan API — same source the site uses) and
    reminder-schedule building. All times handled in UTC ISO strings. */
 
 const PRAYERS = ['Fajr', 'Dhuhr', 'Asr', 'Maghrib', 'Isha'];
 
 /* Fetch timings for a date (YYYY-MM-DD) at lat/lon. Returns {Prayer: "HH:MM"} in 24h. */
-async function fetchTimings(dateStr, lat, lon, method, madhab) {
+export async function fetchTimings(dateStr, lat, lon, method, madhab) {
   const [y, m, d] = dateStr.split('-');
   const url = `https://api.aladhan.com/v1/timings/${d}-${m}-${y}` +
     `?latitude=${lat}&longitude=${lon}&method=${method}&madhab=${madhab}`;
@@ -172,7 +172,7 @@ async function fetchTimings(dateStr, lat, lon, method, madhab) {
 }
 
 /* Date string YYYY-MM-DD for "today" in a given IANA timezone. */
-function todayInTz(tz, whenMs) {
+export function todayInTz(tz, whenMs) {
   const dtf = new Intl.DateTimeFormat('en-CA', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
   });
@@ -182,7 +182,7 @@ function todayInTz(tz, whenMs) {
 /* Build reminder schedule: [{prayer, at: ISO_UTC}] sorted by time.
    remind = {Fajr: 15, ...} minutes before. tz = user's IANA timezone.
    We interpret the HH:MM as wall-clock in tz, then convert to UTC. */
-function buildSchedule(dateStr, timings, remind, tz) {
+export function buildSchedule(dateStr, timings, remind, tz) {
   const items = [];
   for (const p of PRAYERS) {
     const mins = remind[p];
@@ -215,7 +215,6 @@ function tzOffsetMs(tz, utcMs) {
   const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour % 24, +parts.minute, +parts.second);
   return asUtc - utcMs;
 }
-
 /* dailydeenhub-push — Web Push backend for prayer alerts.
    Routes:
      GET  /api/vapid-key          -> {key} public VAPID key (base64url)
@@ -223,6 +222,8 @@ function tzOffsetMs(tz, utcMs) {
      POST /api/unsubscribe        -> remove by endpoint
    Cron (every minute): send due reminders, advance each sub's next_fire.
 */
+import { sendPush } from './webpush.js';
+import { fetchTimings, buildSchedule, todayInTz } from './prayer.js';
 
 const ALLOWED_ORIGINS = new Set([
   'https://dailydeenhub.com',
@@ -257,7 +258,7 @@ function vapidEnv(env) {
   };
 }
 
-const __worker = {
+export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders(req) });
@@ -403,5 +404,3 @@ function prayerTitle(prayer, lang, mins) {
   if (mins === 0) return lang === 'tr' ? `${n} vakti` : `${n} time`;
   return lang === 'tr' ? `${n} — ${mins} dk kaldı` : `${n} — ${mins} min left`;
 }
-
-export default __worker;

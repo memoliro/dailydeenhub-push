@@ -1,0 +1,17 @@
+name = "dailydeenhub-push"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dailydeenhub-push"
+database_id = "REPLACE_WITH_D1_ID"
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+VAPID_SUBJECT = "mailto:memoliro@gmail.com"
+# VAPID_PUBLIC and VAPID_PRIVATE_JWK go in .dev.vars (local) and as secrets (prod):
+#   npx wrangler secret put VAPID_PUBLIC
+#   npx wrangler secret put VAPID_PRIVATE_JWK
