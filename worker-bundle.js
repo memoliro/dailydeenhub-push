@@ -222,8 +222,6 @@ function tzOffsetMs(tz, utcMs) {
      POST /api/unsubscribe        -> remove by endpoint
    Cron (every minute): send due reminders, advance each sub's next_fire.
 */
-import { sendPush } from './webpush.js';
-import { fetchTimings, buildSchedule, todayInTz } from './prayer.js';
 
 const ALLOWED_ORIGINS = new Set([
   'https://dailydeenhub.com',
