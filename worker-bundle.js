@@ -1,6 +1,6 @@
 /* Bundled single-file worker for dashboard deploy.
    Sources: src/webpush.js + src/prayer.js + src/index.js
-   Built: 2026-10-10 — includes /api/debug endpoint + Urgency:high on pushes */
+   Built: 2026-10-11 */
 /* Minimal Web Push (RFC 8291 aes128gcm + VAPID RFC 8292) for Cloudflare Workers.
    Uses WebCrypto only. No Node dependencies. */
 
@@ -64,20 +64,23 @@ async function vapidAuthHeader(audience, subject, privateJwk, publicB64) {
   const unsignedToken = header + '.' + claims;
   const key = await crypto.subtle.importKey('jwk', privateJwk,
     { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
-  const sigDer = new Uint8Array(await crypto.subtle.sign(
+  const sigBytes = new Uint8Array(await crypto.subtle.sign(
     { name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(unsignedToken)));
-  // DER -> raw R||S (64 bytes)
-  let off = 2;
-  if (sigDer[off] === 0) off++; // skip leading zero pad if present (then adjust)
-  // parse properly:
-  let p = 2;
-  const rLen = sigDer[p + 1]; p += 2;
-  let r = sigDer.slice(p, p + rLen); p += rLen;
-  const sLen = sigDer[p + 1]; p += 2;
-  let s = sigDer.slice(p, p + sLen);
-  const raw = new Uint8Array(64);
-  raw.set(r.slice(-32), 32 - Math.min(32, r.length));
-  raw.set(s.slice(-32), 64 - Math.min(32, s.length));
+  // Normalize to raw R||S (64 bytes). Cloudflare Workers returns raw already;
+  // other runtimes return DER — handle both.
+  let raw;
+  if (sigBytes.length === 64 && sigBytes[0] !== 0x30) {
+    raw = sigBytes;
+  } else {
+    let p = 2;
+    const rLen = sigBytes[p + 1]; p += 2;
+    let r = sigBytes.slice(p, p + rLen); p += rLen;
+    const sLen = sigBytes[p + 1]; p += 2;
+    let s = sigBytes.slice(p, p + sLen);
+    raw = new Uint8Array(64);
+    raw.set(r.slice(-32), 32 - Math.min(32, r.length));
+    raw.set(s.slice(-32), 64 - Math.min(32, s.length));
+  }
   const jwt = unsignedToken + '.' + b64urlEncode(raw);
   return 'vapid t=' + jwt + ', k=' + publicB64;
 }
@@ -99,21 +102,24 @@ async function encryptPayload(p256dhB64, authB64, payloadBytes) {
   const sharedSecret = new Uint8Array(sharedBits);
 
   const info = (s) => enc.encode(s);
+  // RFC 8291: secret = HKDF(auth_secret, ecdh_secret, key_info, 32)
   // key_info = "WebPush: info" || 0x00 || client_pub || eph_pub
   const keyInfo = concat(info('WebPush: info'), new Uint8Array([0]), clientPub, ephPubRaw);
-  const ikm = await hkdfExtract(authSecret, concat(sharedSecret, keyInfo));
+  const prk1 = await hkdfExtract(authSecret, sharedSecret);
+  const ikm = await hkdfExpand(prk1, keyInfo, 32);
 
+  // RFC 8291 aes128gcm: PRK = HKDF-Extract(salt, IKM); then Expand for CEK/nonce
   const salt = crypto.getRandomValues(new Uint8Array(16));
+  const prk2 = await hkdfExtract(salt, ikm);
   // cek_info = "Content-Encoding: aes128gcm" || 0x00
   const cekInfo = concat(info('Content-Encoding: aes128gcm'), new Uint8Array([0]));
-  const prk = await hkdfExtract(salt, ikm);
-  const cek = await hkdfExpand(prk, cekInfo, 16);
+  const cek = await hkdfExpand(prk2, cekInfo, 16);
   // nonce_info = "Content-Encoding: nonce" || 0x00
   const nonceInfo = concat(info('Content-Encoding: nonce'), new Uint8Array([0]));
-  const nonce = await hkdfExpand(prk, nonceInfo, 12);
+  const nonce = await hkdfExpand(prk2, nonceInfo, 12);
 
-  // pad: 2-byte big-endian pad length (0) + payload
-  const plaintext = concat(new Uint8Array([0, 0]), payloadBytes);
+  // plaintext = payload || 0x02 (aes128gcm delimiter at END)
+  const plaintext = concat(payloadBytes, new Uint8Array([2]));
   const aesKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt']);
   const ct = new Uint8Array(await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: nonce }, aesKey, plaintext));
@@ -356,7 +362,12 @@ async function handleOneSub(env, sub, vapid) {
 
   // 1. send the push for the due prayer
   const mins = remind[sub.next_prayer];
-  const title = prayerTitle(sub.next_prayer, sub.lang, mins);
+  // schedule_date is the prayer's local date (YYYY-MM-DD in sub.tz);
+  // noon UTC keeps the weekday lookup immune to timezone shifts.
+  const isFriday = sub.schedule_date
+    ? new Date(sub.schedule_date + 'T12:00:00Z').getUTCDay() === 5
+    : false;
+  const title = prayerTitle(sub.next_prayer, sub.lang, mins, isFriday);
   const status = await sendPush(
     { endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth },
     { title, prayer: sub.next_prayer, mins, url: 'https://dailydeenhub.com/' },
@@ -394,11 +405,13 @@ async function handleOneSub(env, sub, vapid) {
   ).bind(dateStr, upcoming ? upcoming.at : null, upcoming ? upcoming.prayer : null, sub.endpoint).run();
 }
 
-function prayerTitle(prayer, lang, mins) {
+function prayerTitle(prayer, lang, mins, isFriday) {
   const names = lang === 'tr'
     ? { Fajr: 'İmsak', Dhuhr: 'Öğle', Asr: 'İkindi', Maghrib: 'Akşam', Isha: 'Yatsı' }
     : { Fajr: 'Fajr', Dhuhr: 'Dhuhr', Asr: 'Asr', Maghrib: 'Maghrib', Isha: 'Isha' };
-  const n = names[prayer] || prayer;
+  let n = names[prayer] || prayer;
+  // Fridays: Dhuhr is Jumu'ah / Cuma — matches the site's nameOf() in app.js
+  if (prayer === 'Dhuhr' && isFriday) n = lang === 'tr' ? 'Cuma' : "Jumu'ah";
   if (mins === 0) return lang === 'tr' ? `${n} vakti` : `${n} time`;
   return lang === 'tr' ? `${n} — ${mins} dk kaldı` : `${n} — ${mins} min left`;
 }
