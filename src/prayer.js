@@ -32,7 +32,10 @@ export function todayInTz(tz, whenMs) {
 }
 
 /* Build reminder schedule: [{prayer, at: ISO_UTC}] sorted by time.
-   remind = {Fajr: 15, ...} minutes before. tz = user's IANA timezone.
+   remind = {Fajr: 15, ...} minutes before. Extra reminders ride the same
+   object as "x:<key>": x:sahur / x:tahajjud / x:fast (mins before Fajr),
+   x:fastEve (1 = nudge at 9 PM the evening before a fast day),
+   x:jumuah (mins before Friday Dhuhr). tz = user's IANA timezone.
    We interpret the HH:MM as wall-clock in tz, then convert to UTC. */
 export function buildSchedule(dateStr, timings, remind, tz) {
   const items = [];
@@ -44,8 +47,42 @@ export function buildSchedule(dateStr, timings, remind, tz) {
     const fireMs = utcMs - mins * 60 * 1000;
     items.push({ prayer: p, at: new Date(fireMs).toISOString() });
   }
+  // ---- extra reminders ----
+  const EXTRA = [
+    { key: 'sahur', anchor: 'Fajr' },
+    { key: 'tahajjud', anchor: 'Fajr' },
+    { key: 'fast', anchor: 'Fajr', weekdays: [1, 4] }, // Mon/Thu
+    { key: 'jumuah', anchor: 'Dhuhr', weekdays: [5] }, // Friday
+  ];
+  const wd = weekdayInTz(dateStr, tz);
+  for (const def of EXTRA) {
+    const mins = remind['x:' + def.key];
+    if (mins === undefined || mins === null) continue;
+    if (def.weekdays && !def.weekdays.includes(wd)) continue;
+    const fireMs = wallToUtc(dateStr, timings[def.anchor], tz) - mins * 60 * 1000;
+    items.push({ prayer: def.key, at: new Date(fireMs).toISOString() });
+  }
+  if (remind['x:fastEve']) {
+    // nudge at 9 PM local on the evening before a Mon/Thu fast day
+    const tomorrowWd = weekdayInTz(addDays(dateStr, 1), tz);
+    if (tomorrowWd === 1 || tomorrowWd === 4) {
+      items.push({ prayer: 'fastEve', at: new Date(wallToUtc(dateStr, '21:00', tz)).toISOString() });
+    }
+  }
   items.sort((a, b) => a.at < b.at ? -1 : 1);
   return items;
+}
+
+/* Weekday (0=Sun..6=Sat) of a YYYY-MM-DD date in the given timezone. */
+export function weekdayInTz(dateStr, tz) {
+  const utcMs = wallToUtc(dateStr, '12:00', tz); // local noon: safely on that date
+  const name = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).format(new Date(utcMs));
+  return { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[name];
+}
+
+function addDays(dateStr, n) {
+  const [Y, M, D] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(Y, M - 1, D + n)).toISOString().slice(0, 10);
 }
 
 /* Convert YYYY-MM-DD + HH:MM wall-clock in tz to UTC milliseconds. */

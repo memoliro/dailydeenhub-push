@@ -140,8 +140,13 @@ async function handleOneSub(env, sub, vapid) {
   const remind = JSON.parse(sub.remind_json || '{}');
 
   // 1. send the push for the due prayer
-  const mins = remind[sub.next_prayer];
-  const title = prayerTitle(sub.next_prayer, sub.lang, mins);
+  const mins = remind[sub.next_prayer] !== undefined ? remind[sub.next_prayer] : remind['x:' + sub.next_prayer];
+  // schedule_date is the prayer's local date (YYYY-MM-DD in sub.tz);
+  // noon UTC keeps the weekday lookup immune to timezone shifts.
+  const isFriday = sub.schedule_date
+    ? new Date(sub.schedule_date + 'T12:00:00Z').getUTCDay() === 5
+    : false;
+  const title = prayerTitle(sub.next_prayer, sub.lang, mins, isFriday);
   const status = await sendPush(
     { endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth },
     { title, prayer: sub.next_prayer, mins, url: 'https://dailydeenhub.com/' },
@@ -179,11 +184,21 @@ async function handleOneSub(env, sub, vapid) {
   ).bind(dateStr, upcoming ? upcoming.at : null, upcoming ? upcoming.prayer : null, sub.endpoint).run();
 }
 
-function prayerTitle(prayer, lang, mins) {
+function prayerTitle(prayer, lang, mins, isFriday) {
+  const extraNames = lang === 'tr'
+    ? { sahur: 'Sahur', tahajjud: 'Teheccüd', fast: 'Pazartesi/Perşembe orucu', fastEve: 'Yarın oruç', jumuah: 'Cuma' }
+    : { sahur: 'Sahur', tahajjud: 'Tahajjud', fast: 'Mon/Thu fast', fastEve: 'Fast tomorrow', jumuah: "Jumu'ah" };
+  if (extraNames[prayer]) {
+    const n = extraNames[prayer];
+    if (prayer === 'fastEve') return lang === 'tr' ? 'Yarın oruç — hazırlığı unutma' : "Fast tomorrow — don't forget to prepare";
+    return lang === 'tr' ? `${n} — ${mins} dk kaldı` : `${n} — ${mins} min left`;
+  }
   const names = lang === 'tr'
     ? { Fajr: 'İmsak', Dhuhr: 'Öğle', Asr: 'İkindi', Maghrib: 'Akşam', Isha: 'Yatsı' }
     : { Fajr: 'Fajr', Dhuhr: 'Dhuhr', Asr: 'Asr', Maghrib: 'Maghrib', Isha: 'Isha' };
-  const n = names[prayer] || prayer;
+  let n = names[prayer] || prayer;
+  // Fridays: Dhuhr is Jumu'ah / Cuma — matches the site's nameOf() in app.js
+  if (prayer === 'Dhuhr' && isFriday) n = lang === 'tr' ? 'Cuma' : "Jumu'ah";
   if (mins === 0) return lang === 'tr' ? `${n} vakti` : `${n} time`;
   return lang === 'tr' ? `${n} — ${mins} dk kaldı` : `${n} — ${mins} min left`;
 }
