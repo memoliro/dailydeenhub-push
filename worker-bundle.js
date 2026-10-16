@@ -1,6 +1,6 @@
 /* Bundled single-file worker for dashboard deploy.
    Sources: src/webpush.js + src/prayer.js + src/index.js
-   Built: 2026-10-14 */
+   Built: 2026-10-16 */
 /* Minimal Web Push (RFC 8291 aes128gcm + VAPID RFC 8292) for Cloudflare Workers.
    Uses WebCrypto only. No Node dependencies. */
 
@@ -349,7 +349,7 @@ export default {
       return json(req, { ok: true, next_fire: upcoming ? upcoming.at : null });
     }
 
-    if (url.pathname === '/api/debug' && req.method === 'GET') {
+    if (false) { // /api/debug removed (2026-10-16): exposed subscription data publicly
       const rows = await env.DB.prepare(
         `SELECT substr(endpoint,1,50) AS ep, next_fire, next_prayer, schedule_date, tz, lang, updated_at FROM subs ORDER BY updated_at DESC LIMIT 20`
       ).run();
@@ -396,50 +396,60 @@ async function runDueReminders(env) {
 async function handleOneSub(env, sub, vapid) {
   const nowMs = Date.now();
   const remind = JSON.parse(sub.remind_json || '{}');
+  const duePrayer = sub.next_prayer;
+  const dueDateStr = sub.schedule_date;
 
-  // 1. send the push for the due prayer
-  const mins = remind[sub.next_prayer] !== undefined ? remind[sub.next_prayer] : remind['x:' + sub.next_prayer];
+  // 1. ADVANCE FIRST, send after. The old order (send → fetch timings →
+  // update DB) meant a slow fetchTimings or overlapping cron runs would see
+  // the same next_fire still due and re-send the push 2-3 times. Advancing
+  // first claims the slot; a later failure only misses a notification,
+  // never duplicates one.
+  let dateStr = todayInTz(sub.tz, nowMs);
+  let upcoming = null;
+  try {
+    const timings = await fetchTimings(dateStr, sub.lat, sub.lon, sub.method, sub.madhab);
+    const sched = buildSchedule(dateStr, timings, remind, sub.tz);
+    upcoming = sched.find(i => i.at > new Date(nowMs).toISOString());
+    if (!upcoming) {
+      // nothing left today — schedule tomorrow's first
+      const tomorrowMs = nowMs + 24 * 3600 * 1000;
+      const tomorrowStr = todayInTz(sub.tz, tomorrowMs);
+      const timings2 = await fetchTimings(tomorrowStr, sub.lat, sub.lon, sub.method, sub.madhab);
+      const sched2 = buildSchedule(tomorrowStr, timings2, remind, sub.tz);
+      upcoming = sched2[0] || null;
+      dateStr = tomorrowStr;
+    }
+  } catch (e) {
+    // Timings unavailable: back off 10 minutes instead of leaving next_fire
+    // in the past (which re-sent the same push every cron tick).
+    console.log('timings failed, backing off', sub.endpoint.slice(0, 40), e.message);
+    const backoff = new Date(nowMs + 10 * 60 * 1000).toISOString();
+    await env.DB.prepare(
+      `UPDATE subs SET next_fire = ?, updated_at = datetime('now') WHERE endpoint = ?`
+    ).bind(backoff, sub.endpoint).run();
+    return;
+  }
+  await env.DB.prepare(
+    `UPDATE subs SET schedule_date = ?, next_fire = ?, next_prayer = ?, updated_at = datetime('now') WHERE endpoint = ?`
+  ).bind(dateStr, upcoming ? upcoming.at : null, upcoming ? upcoming.prayer : null, sub.endpoint).run();
+
+  // 2. now send the push for the due prayer
+  const mins = remind[duePrayer] !== undefined ? remind[duePrayer] : remind['x:' + duePrayer];
   // schedule_date is the prayer's local date (YYYY-MM-DD in sub.tz);
   // noon UTC keeps the weekday lookup immune to timezone shifts.
-  const isFriday = sub.schedule_date
-    ? new Date(sub.schedule_date + 'T12:00:00Z').getUTCDay() === 5
+  const isFriday = dueDateStr
+    ? new Date(dueDateStr + 'T12:00:00Z').getUTCDay() === 5
     : false;
-  const title = prayerTitle(sub.next_prayer, sub.lang, mins, isFriday);
+  const title = prayerTitle(duePrayer, sub.lang, mins, isFriday);
   const status = await sendPush(
     { endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth },
-    { title, prayer: sub.next_prayer, mins, url: 'https://dailydeenhub.com/' },
+    { title, prayer: duePrayer, mins, url: 'https://dailydeenhub.com/' },
     vapid
   );
   if (status === 404 || status === 410) {
     // subscription dead — remove it
     await env.DB.prepare('DELETE FROM subs WHERE endpoint = ?').bind(sub.endpoint).run();
-    return;
   }
-
-  // 2. advance to the next reminder
-  let dateStr = todayInTz(sub.tz, nowMs);
-  let sched;
-  if (sub.schedule_date === dateStr) {
-    // rebuild from the same timings is wasteful; recompute cheaply via API (cached by Aladhan CDN)
-    const timings = await fetchTimings(dateStr, sub.lat, sub.lon, sub.method, sub.madhab);
-    sched = buildSchedule(dateStr, timings, remind, sub.tz);
-  } else {
-    const timings = await fetchTimings(dateStr, sub.lat, sub.lon, sub.method, sub.madhab);
-    sched = buildSchedule(dateStr, timings, remind, sub.tz);
-  }
-  let upcoming = sched.find(i => i.at > new Date(nowMs).toISOString());
-  if (!upcoming) {
-    // nothing left today — schedule tomorrow's first
-    const tomorrowMs = nowMs + 24 * 3600 * 1000;
-    const tomorrowStr = todayInTz(sub.tz, tomorrowMs);
-    const timings = await fetchTimings(tomorrowStr, sub.lat, sub.lon, sub.method, sub.madhab);
-    const sched2 = buildSchedule(tomorrowStr, timings, remind, sub.tz);
-    upcoming = sched2[0] || null;
-    dateStr = tomorrowStr;
-  }
-  await env.DB.prepare(
-    `UPDATE subs SET schedule_date = ?, next_fire = ?, next_prayer = ?, updated_at = datetime('now') WHERE endpoint = ?`
-  ).bind(dateStr, upcoming ? upcoming.at : null, upcoming ? upcoming.prayer : null, sub.endpoint).run();
 }
 
 function prayerTitle(prayer, lang, mins, isFriday) {
