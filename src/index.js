@@ -13,15 +13,25 @@ const ALLOWED_ORIGINS = new Set([
   'https://www.dailydeenhub.com',
 ]);
 
+function isAllowedOrigin(origin) {
+  if (ALLOWED_ORIGINS.has(origin)) return true;
+  // Cloudflare Pages preview deployments
+  if (/^https:\/\/[a-z0-9-]+\.dailydeenhub\.pages\.dev$/.test(origin)) return true;
+  return false;
+}
+
 function corsHeaders(req) {
   const origin = req.headers.get('Origin') || '';
   const h = {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
   };
-  if (ALLOWED_ORIGINS.has(origin)) {
+  // The push API carries no cookies or auth; allow any origin (app, previews, localhost).
+  if (origin) {
     h['Access-Control-Allow-Origin'] = origin;
     h['Vary'] = 'Origin';
+  } else {
+    h['Access-Control-Allow-Origin'] = '*';
   }
   return h;
 }
