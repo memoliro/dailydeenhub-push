@@ -1,0 +1,5 @@
+.vapid.env
+.vapid.json
+.vapid-new.env
+NEW-VAPID-KEYS-temp.txt
+node_modules/
